@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  attestations: write
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate tag
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "tag refused: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: |
+          if [ "$(id -u)" -eq 0 ]; then APT=apt-get; else APT="sudo apt-get"; fi
+          $APT update
+          $APT install -y build-essential ca-certificates curl unzip
+
+      - id: ndk-zip
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/android-ndk-r30-linux.zip
+          key: android-ndk-r30-${{ runner.os }}-5107f898313790e449e87eee2183d9a20602dee9
+
+      - name: Download NDK zip
+        if: steps.ndk-zip.outputs.cache-hit != 'true'
+        run: curl -fsSL -o "$RUNNER_TEMP/android-ndk-r30-linux.zip" https://dl.google.com/android/repository/android-ndk-r30-linux.zip
+
+      - name: Check NDK checksum
+        run: |
+          set -euo pipefail
+          zip="$RUNNER_TEMP/android-ndk-r30-linux.zip"
+          url="https://dl.google.com/android/repository/android-ndk-r30-linux.zip"
+          sum="5107f898313790e449e87eee2183d9a20602dee9"
+          verify() {
+            printf '%s  %s\n' "$sum" "$zip" | sha1sum -c -
+          }
+          if ! verify; then
+            rm -f "$zip"
+            curl -fsSL -o "$zip" "$url"
+            verify
+          fi
+
+      - name: Unpack NDK
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/android-ndk"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          unzip -q "$RUNNER_TEMP/android-ndk-r30-linux.zip" -d "$dest"
+          mapfile -t roots < <(find "$dest" -type f -name source.properties -printf '%h\n' | sort -u)
+          if [ "${#roots[@]}" -ne 1 ] || [ -z "${roots[0]}" ]; then
+            echo "expected one unpacked directory with source.properties" >&2
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=${roots[0]}" >> "$GITHUB_ENV"
+          clang="${roots[0]}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          if [ ! -x "$clang" ]; then
+            echo "clang wrapper is not executable: $clang" >&2
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: make build-all
+
+      - name: Check release binaries
+        run: |
+          set -euo pipefail
+          expected=(
+            bin/ghostdl-unofficial-linux-386
+            bin/ghostdl-unofficial-linux-amd64
+            bin/ghostdl-unofficial-linux-armv7
+            bin/ghostdl-unofficial-linux-arm64
+            bin/ghostdl-unofficial-linux-riscv64
+            bin/ghostdl-unofficial-darwin-amd64
+            bin/ghostdl-unofficial-darwin-arm64
+            bin/ghostdl-unofficial-windows-386.exe
+            bin/ghostdl-unofficial-windows-amd64.exe
+            bin/ghostdl-unofficial-windows-arm64.exe
+            bin/ghostdl-unofficial-android-armv7
+            bin/ghostdl-unofficial-android-arm64
+            bin/ghostdl-unofficial-android-386
+            bin/ghostdl-unofficial-android-amd64
+          )
+          shopt -s nullglob
+          found=(bin/ghostdl-unofficial-*)
+          if [ "${#found[@]}" -ne 14 ]; then
+            echo "expected 14 release binaries, found ${#found[@]}" >&2
+            printf '%s\n' "${found[@]}" >&2
+            exit 1
+          fi
+          for f in "${expected[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "missing $f" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        continue-on-error: ${{ github.server_url != 'https://github.com' }}
+        with:
+          name: release-binaries
+          path: bin/ghostdl-unofficial-*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Attest release binaries
+        if: github.server_url == 'https://github.com'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: bin/ghostdl-unofficial-*
+
+      - name: Publish GitHub Release
+        if: github.server_url == 'https://github.com'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="Run: gh attestation verify <file> -R ${{ github.repository }}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber bin/ghostdl-unofficial-*
+          else
+            args=(
+              --verify-tag
+              --title "Release $GITHUB_REF_NAME"
+              --notes "$notes"
+            )
+            if [[ "$GITHUB_REF_NAME" =~ -[0-9A-Za-z.]+$ ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" "${args[@]}" bin/ghostdl-unofficial-*
+          fi
